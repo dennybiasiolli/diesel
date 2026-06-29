@@ -140,9 +140,10 @@ pub(crate) fn enrich_sql_error(error: diesel::result::Error, sql: &str) -> diese
             let Some(pos) = info.statement_position() else {
                 return Error::DatabaseError(kind, info);
             };
-            // PostgreSQL statement positions are 1-based character offsets into the query.
+            // PostgreSQL statement positions are 1-based *character* offsets into the query
+            // (not bytes). See PG_DIAG_STATEMENT_POSITION / PQresultErrorField.
             let pos = pos.max(1) as usize;
-            let (line, column) = byte_offset_to_line_column(sql, pos.saturating_sub(1));
+            let (line, column) = char_offset_to_line_column(sql, pos - 1);
             let message = format!("{} at line {}, column {}", info.message(), line, column);
             Error::DatabaseError(
                 kind,
@@ -153,7 +154,9 @@ pub(crate) fn enrich_sql_error(error: diesel::result::Error, sql: &str) -> diese
                     table_name: info.table_name().map(str::to_owned),
                     column_name: info.column_name().map(str::to_owned),
                     constraint_name: info.constraint_name().map(str::to_owned),
-                    statement_position: info.statement_position(),
+                    // Position is already reflected as line/column in `message` so
+                    // `Error`'s Display does not also append "at character position N".
+                    statement_position: None,
                 }),
             )
         }
@@ -161,17 +164,22 @@ pub(crate) fn enrich_sql_error(error: diesel::result::Error, sql: &str) -> diese
     }
 }
 
-fn byte_offset_to_line_column(sql: &str, byte_offset: usize) -> (usize, usize) {
-    let offset = byte_offset.min(sql.len());
+/// Map a 0-based Unicode scalar offset into `sql` to 1-based line and column.
+fn char_offset_to_line_column(sql: &str, char_offset: usize) -> (usize, usize) {
     let mut line = 1usize;
-    let mut last_nl = 0usize;
-    for (i, b) in sql.bytes().enumerate().take(offset) {
-        if b == b'\n' {
+    let mut column = 1usize;
+    for (i, ch) in sql.chars().enumerate() {
+        if i == char_offset {
+            return (line, column);
+        }
+        if ch == '\n' {
             line += 1;
-            last_nl = i + 1;
+            column = 1;
+        } else {
+            column += 1;
         }
     }
-    let column = offset.saturating_sub(last_nl) + 1;
+    // Past the end of the string: report the position after the last character.
     (line, column)
 }
 
@@ -211,14 +219,72 @@ impl diesel::result::DatabaseErrorInformation for EnrichedDatabaseError {
 
 #[cfg(test)]
 mod tests {
-    use super::byte_offset_to_line_column;
+    use super::char_offset_to_line_column;
+    use diesel::result::{DatabaseErrorInformation, DatabaseErrorKind, Error};
 
     #[test]
-    fn maps_byte_offset_to_line_and_column() {
+    fn maps_char_offset_to_line_and_column() {
         let sql = "SELECT 1;\nCREATE TABLE t (id INT);\n";
-        // offset at 'C' of CREATE (after "SELECT 1;\n")
-        assert_eq!(byte_offset_to_line_column(sql, 10), (2, 1));
-        assert_eq!(byte_offset_to_line_column(sql, 0), (1, 1));
-        assert_eq!(byte_offset_to_line_column("abc", 1), (1, 2));
+        // 0-based char offset of 'C' in CREATE (after "SELECT 1;\n")
+        assert_eq!(char_offset_to_line_column(sql, 10), (2, 1));
+        assert_eq!(char_offset_to_line_column(sql, 0), (1, 1));
+        assert_eq!(char_offset_to_line_column("abc", 1), (1, 2));
+    }
+
+    #[test]
+    fn maps_char_offset_with_multibyte_utf8() {
+        // 'é' is one Unicode scalar but two UTF-8 bytes; positions must use characters.
+        let sql = "SELECT 'café';\nCREATE";
+        // "SELECT '" = 8, "café" = 4, "';\n" = 3 → 'C' at 0-based char index 15
+        assert_eq!(char_offset_to_line_column(sql, 15), (2, 1));
+        // Byte index of 'C' would be 16; using that would wrongly report line 2, column 2.
+        assert_ne!(char_offset_to_line_column(sql, 16), (2, 1));
+    }
+
+    #[test]
+    fn enrich_clears_statement_position_after_line_column() {
+        struct FakeInfo;
+        impl DatabaseErrorInformation for FakeInfo {
+            fn message(&self) -> &str {
+                "syntax error at or near \"CREATE\""
+            }
+            fn details(&self) -> Option<&str> {
+                None
+            }
+            fn hint(&self) -> Option<&str> {
+                None
+            }
+            fn table_name(&self) -> Option<&str> {
+                None
+            }
+            fn column_name(&self) -> Option<&str> {
+                None
+            }
+            fn constraint_name(&self) -> Option<&str> {
+                None
+            }
+            fn statement_position(&self) -> Option<i32> {
+                Some(11) // 1-based char position of 'C' in "SELECT 1;\nCREATE"
+            }
+        }
+
+        let sql = "SELECT 1;\nCREATE TABLE t (id INT);\n";
+        let err = Error::DatabaseError(DatabaseErrorKind::Unknown, Box::new(FakeInfo));
+        let enriched = super::enrich_sql_error(err, sql);
+        match &enriched {
+            Error::DatabaseError(_, info) => {
+                assert_eq!(
+                    info.message(),
+                    "syntax error at or near \"CREATE\" at line 2, column 1"
+                );
+                assert_eq!(info.statement_position(), None);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        // Display must not append a second position line.
+        assert_eq!(
+            enriched.to_string(),
+            "syntax error at or near \"CREATE\" at line 2, column 1"
+        );
     }
 }
