@@ -378,7 +378,19 @@ impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Error::InvalidCString(ref nul_err) => write!(f, "{nul_err}"),
-            Error::DatabaseError(_, ref e) => write!(f, "{}", e.message()),
+            Error::DatabaseError(_, ref e) => {
+                write!(f, "{}", e.message())?;
+                if let Some(details) = e.details() {
+                    write!(f, "\n{details}")?;
+                }
+                if let Some(hint) = e.hint() {
+                    write!(f, "\nhint: {hint}")?;
+                }
+                if let Some(pos) = e.statement_position() {
+                    write!(f, "\nat character position {pos}")?;
+                }
+                Ok(())
+            }
             Error::NotFound => f.write_str("Record not found"),
             Error::QueryBuilderError(ref e) => e.fmt(f),
             Error::DeserializationError(ref e) => e.fmt(f),

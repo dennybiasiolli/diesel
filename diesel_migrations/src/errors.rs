@@ -129,3 +129,96 @@ impl fmt::Display for RunMigrationsError {
         }
     }
 }
+
+/// Attach line/column information from the migration SQL when the backend reports a
+/// statement position (PostgreSQL). See diesel-rs/diesel#2378.
+pub(crate) fn enrich_sql_error(error: diesel::result::Error, sql: &str) -> diesel::result::Error {
+    use diesel::result::Error;
+
+    match error {
+        Error::DatabaseError(kind, info) => {
+            let Some(pos) = info.statement_position() else {
+                return Error::DatabaseError(kind, info);
+            };
+            // PostgreSQL statement positions are 1-based character offsets into the query.
+            let pos = pos.max(1) as usize;
+            let (line, column) = byte_offset_to_line_column(sql, pos.saturating_sub(1));
+            let message = format!("{} at line {}, column {}", info.message(), line, column);
+            Error::DatabaseError(
+                kind,
+                Box::new(EnrichedDatabaseError {
+                    message,
+                    details: info.details().map(str::to_owned),
+                    hint: info.hint().map(str::to_owned),
+                    table_name: info.table_name().map(str::to_owned),
+                    column_name: info.column_name().map(str::to_owned),
+                    constraint_name: info.constraint_name().map(str::to_owned),
+                    statement_position: info.statement_position(),
+                }),
+            )
+        }
+        other => other,
+    }
+}
+
+fn byte_offset_to_line_column(sql: &str, byte_offset: usize) -> (usize, usize) {
+    let offset = byte_offset.min(sql.len());
+    let mut line = 1usize;
+    let mut last_nl = 0usize;
+    for (i, b) in sql.bytes().enumerate().take(offset) {
+        if b == b'\n' {
+            line += 1;
+            last_nl = i + 1;
+        }
+    }
+    let column = offset.saturating_sub(last_nl) + 1;
+    (line, column)
+}
+
+struct EnrichedDatabaseError {
+    message: String,
+    details: Option<String>,
+    hint: Option<String>,
+    table_name: Option<String>,
+    column_name: Option<String>,
+    constraint_name: Option<String>,
+    statement_position: Option<i32>,
+}
+
+impl diesel::result::DatabaseErrorInformation for EnrichedDatabaseError {
+    fn message(&self) -> &str {
+        &self.message
+    }
+    fn details(&self) -> Option<&str> {
+        self.details.as_deref()
+    }
+    fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
+    fn table_name(&self) -> Option<&str> {
+        self.table_name.as_deref()
+    }
+    fn column_name(&self) -> Option<&str> {
+        self.column_name.as_deref()
+    }
+    fn constraint_name(&self) -> Option<&str> {
+        self.constraint_name.as_deref()
+    }
+    fn statement_position(&self) -> Option<i32> {
+        self.statement_position
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::byte_offset_to_line_column;
+
+    #[test]
+    fn maps_byte_offset_to_line_and_column() {
+        let sql = "SELECT 1;\nCREATE TABLE t (id INT);\n";
+        // offset at 'C' of CREATE (after "SELECT 1;\n")
+        assert_eq!(byte_offset_to_line_column(sql, 10), (2, 1));
+        assert_eq!(byte_offset_to_line_column(sql, 0), (1, 1));
+        assert_eq!(byte_offset_to_line_column("abc", 1), (1, 2));
+    }
+}

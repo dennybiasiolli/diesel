@@ -296,7 +296,9 @@ fn run_sql_from_file<DB: Backend>(
     }
 
     conn.batch_execute(&sql)
-        .map_err(|e| RunMigrationsError::QueryError(name.clone(), e))?;
+        .map_err(|e| {
+            RunMigrationsError::QueryError(name.clone(), crate::errors::enrich_sql_error(e, &sql))
+        })?;
     Ok(())
 }
 

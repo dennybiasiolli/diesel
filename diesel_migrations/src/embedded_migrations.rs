@@ -91,7 +91,7 @@ impl<DB: Backend> Migration<DB> for &EmbeddedMigration {
         Ok(conn.batch_execute(self.up).map_err(|e| {
             let name = DieselMigrationName::from_name(self.name.name)
                 .expect("We have a valid name here, we checked this in `embed_migration!`");
-            RunMigrationsError::QueryError(name, e)
+            RunMigrationsError::QueryError(name, crate::errors::enrich_sql_error(e, self.up))
         })?)
     }
 
@@ -100,7 +100,7 @@ impl<DB: Backend> Migration<DB> for &EmbeddedMigration {
             Some(down) => Ok(conn.batch_execute(down).map_err(|e| {
                 let name = DieselMigrationName::from_name(self.name.name)
                     .expect("We have a valid name here, we checked this in `embed_migration!`");
-                RunMigrationsError::QueryError(name, e)
+                RunMigrationsError::QueryError(name, crate::errors::enrich_sql_error(e, down))
             })?),
             None => Err(MigrationError::NoMigrationRevertFile.into()),
         }
