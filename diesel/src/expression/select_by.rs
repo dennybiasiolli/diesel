@@ -6,6 +6,7 @@ use crate::expression::{
 };
 use crate::query_builder::*;
 use crate::result::QueryResult;
+use crate::util::TupleSize;
 use alloc::vec::Vec;
 
 #[derive(Debug)]
@@ -57,6 +58,18 @@ where
             p: core::marker::PhantomData,
         }
     }
+}
+
+// Required so tuples containing `SelectBy` implement `TupleSize`, which is needed for
+// `StaticallySizedRow` when deserializing nested tuples that include `SelectBy` (e.g. custom
+// `QueryFragment` wrappers whose `SqlType` is `(T::SqlType, BigInt)`). See diesel-rs/diesel#4292.
+impl<T, DB> TupleSize for SelectBy<T, DB>
+where
+    T: Selectable<DB>,
+    DB: Backend,
+    SqlTypeOf<T::SelectExpression>: TupleSize,
+{
+    const SIZE: usize = <SqlTypeOf<T::SelectExpression> as TupleSize>::SIZE;
 }
 
 impl<T, E, DB> Expression for SelectBy<T, DB>
