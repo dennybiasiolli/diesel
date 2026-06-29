@@ -735,3 +735,74 @@ fn selecting_crazy_nested_joins() {
     ];
     assert_eq!(Ok(expected), data);
 }
+
+/// Compile-time regression for https://github.com/diesel-rs/diesel/issues/4292
+///
+/// Custom `QueryFragment` wrappers whose `SqlType` nests a tuple of `SelectBy`
+/// (e.g. pagination with `(inner_sql_type, BigInt)`) must implement `LoadQuery`
+/// for the corresponding Rust tuple types. This function is never called; it only
+/// needs to type-check when the test crate is built.
+#[allow(dead_code)]
+fn _issue_4292_nested_select_by_compatible_with_custom_sql_type(conn: &mut TestConnection) {
+    use diesel::backend::Backend;
+    use diesel::query_builder::{Query, QueryFragment, QueryId};
+    use diesel::query_dsl::methods::LoadQuery;
+    use diesel::sql_types::BigInt;
+
+    #[derive(Debug, Clone, Copy, QueryId)]
+    struct Pagination<T> {
+        query: T,
+    }
+
+    impl<T, DB> QueryFragment<DB> for Pagination<T>
+    where
+        DB: Backend,
+        T: QueryFragment<DB>,
+    {
+        fn walk_ast<'b>(
+            &'b self,
+            mut out: diesel::query_builder::AstPass<'_, 'b, DB>,
+        ) -> QueryResult<()> {
+            out.push_sql("SELECT *, COUNT(*) OVER () FROM (");
+            self.query.walk_ast(out.reborrow())?;
+            out.push_sql(") t");
+            Ok(())
+        }
+    }
+
+    impl<T: Query> Query for Pagination<T> {
+        type SqlType = (T::SqlType, BigInt);
+    }
+
+    impl<T> RunQueryDsl<TestConnection> for Pagination<T> {}
+
+    impl<T> Pagination<T> {
+        fn load_with_info<'a, U>(self, conn: &mut TestConnection) -> QueryResult<(Vec<U>, i64)>
+        where
+            Self: LoadQuery<'a, TestConnection, (U, i64)>,
+        {
+            let results = self.load::<(U, i64)>(conn)?;
+            let total = results.first().map(|x| x.1).unwrap_or(0);
+            let records = results.into_iter().map(|x| x.0).collect();
+            Ok((records, total))
+        }
+    }
+
+    #[derive(Debug, Queryable, Selectable)]
+    #[diesel(table_name = users)]
+    struct UserIdName {
+        id: i32,
+        name: String,
+    }
+
+    #[derive(Debug, Queryable, Selectable)]
+    #[diesel(table_name = users)]
+    struct UserHair {
+        hair_color: Option<String>,
+    }
+
+    let _ = Pagination {
+        query: users::table.select((UserIdName::as_select(), UserHair::as_select())),
+    }
+    .load_with_info::<(UserIdName, UserHair)>(conn);
+}
